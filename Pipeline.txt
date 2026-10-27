@@ -1,0 +1,114 @@
+01 genome assembly
+1.hifi assembly
+hifiasm -o prefix.asm -t 30 --ul onto.fq.gz ccs.bam.fa.gz
+2.hic assembly
+bwa mem -SP5M  seq.fasta Lib_R1.fastq.gz Lib_R2.fastq.gz \
+     | samtools view -hF 256 - \
+     | samtools sort -@ $threads -o sorted.bam -T tmp.ali
+samtools index sorted.bam
+samtools view -bq 40 sorted.bam  |samtools view -bt seq.fasta.fai > sample.unique.bam
+PreprocessSAMs.pl sample.unique.bam seq.fasta GATC
+ALLHiC_partition -r seq.fasta -e GATC -k 10 -b sample.unique.REduced.paired_only.bam
+for((K=1;K<=10;K++));do echo "allhic optimize sample.unique.REduced.paired_only.counts_${enzyme}.${group_count}g${K}.txt sample.unique.REduced.paired_only.clm" >> cmd.list;done
+ParaFly -c cmd.list -CPU $threads
+ALLHiC_build seq.fasta
+
+02 gene annotation
+1.gene structure annotation
+1) homologous sequence alignment
+RepeatMasker(v4.1.1) -lib custom_repeats.lib -dir repeatmasker_out -pa 10 -xsmall genome.fa
+RepeatProteinMask(v4.1.0) -noLowSimple -pvalue 0.0001 -lib transposon_proteins.fa genome.fa
+2) predict from scratch: Build a library of repeats
+ltr_finder(v1.07) -D 15000 -d 1000 -L 7000 -l 100 -p 20 -C -M 0.9 genome.fa > ltr_finder.out
+build_lmer_table -sequence genome.fa -freq genome.lmer_table
+RepeatScout(v1.0.5) -sequence genome.fa -output repeatscout.out -freq genome.lmer_table -l 50
+BuildDatabase -name my_genome_db -engine ncbi genome.fa
+RepeatModeler(v1.0.8) -database my_genome_db -pa 10 -LTRStruct
+trf(v4.09) genome.fa 2 7 7 80 10 50 500 -h -d
+3) predict from the beginning
+RepeatMasker(v4.1.1) -a -nolow -no_is -norna -parallel 1 -lib custom_repeats.fa -dir output_dir genome.fa
+2.Gene structure annotation
+1) homologous prediction
+miniprot -t8 --gff miniprot/annot.gff evidence.fasta genome.fa > miniprot/alignments.out
+2) denovo forecasts
+augustus(v3.2.3) --species=human genome.fa > augustus/predictions.gff
+glimmerhmm(v3.0.4) genome.fa -d /path/to/trained_model -g glimmerhmm/predictions.gff
+athom(v2013.11.29) snap/predictions.zff -gene-stats > snap/predictions.gff
+genscan(v1.0) /path/to/genscan/mat_file genome.fa 1 > genscan/predictions.txt
+geneid(v1.4) -P /path/to/parameter_file.cfg -o predictions.gff genome.fa
+3) transcriptome prediction: Aligned to assembly sequences
+hisat2-build(v2.0.8) -p 8 genome.fa genome_index
+hisat2-build(v2.0.8) -p 8 --exon genes.gtf genome.fa genome_index
+4) transcriptome Prediction: Transcript Notes
+stringtie(v2.1.6) sorted.bam -G genes.gtf -o transcripts.gtf -p 8
+5) second-generation transcriptome splicing
+Trinity(v2.1.1) --seqType fq --left left_1.fq,left_2.fq --right right_1.fq,right_2.fq --max_memory 20G --CPU 8 --output trinity_out
+6) transcriptome prediction: Contrast to genome
+Launch_PASA_pipeline.pl(v2.4.1) -c pasa_conf/conf.txt -C -R -g genome.fa -t transcripts.fasta --ALIGNERS blat,gmap --CPU 8
+7) the three outcomes were integrated into a gene set
+evidence_modeler.pl(v1.1.1) --genome genome.fa --weights weights.txt --gene_predictions gene_predictions.gff --protein_alignments protein_align.gff --transcript_alignments transcript_align.gff --output_file evm.out
+8) final annotation
+Launch_PASA_pipeline.pl(v2.4.1) -c pasa_conf/conf.txt -g genome.fa -t transcripts.fasta -A --annots_gff3 existing_annotations.gff3 --CPU 8
+3.Gene function annotations
+interproscan.sh(v5.51-85.0) -i proteins.fasta -f tsv,gff3 -o output.tsv --goterms --pathways
+diamond(v2.0.10) makedb --in nr.fasta -d nr
+diamond(v2.0.10) blastp -d nr.dmnd -q proteins.fasta -o matches.tsv --evalue 1e-5 --max-target-seqs 5
+4.Non-coding RNA annotations
+tRNAscan-SE(v1.4) -o tRNA.out -f tRNA.ss -m tRNA.stats genome.fa
+makeblastdb(v2.2.26) -in ref_seq.fa -dbtype nucl -out my_db
+blastn(v2.2.26) -query query.fa -db my_db -out results.txt -evalue 1e-5 -num_threads 8
+cmscan(v1.0) --tblout rfam_results.tblout Rfam.cm genome.fa > rfam_results.out
+
+
+03 pan-sv
+1.Do DNA sequence alignment and SV calling:
+nucmer --mum -c 500 --maxgap=500 --prefix=prefix --threads=20 ref1.fa ref2.fa
+delta-filter -i 90 -l 500 -1 prefix.delta >prefix.filter.delta
+python syri --no-chrmatch -r ref1.fa -q ref2.fa -d prefix.filter.delta -c prefix.filter.delta.coords --nosnp
+2.Combine and deduplicate SV sets
+SURVIVOR(v1.0.7) merge merge.list 1000 1 1 1 0 50 merge.vcf
+3.graph construction using the vg(v1.49.0)
+vg autoindex -w giraffe --prefix graph -R XG -r genome.fa -v merge.sv.vcf.gz -t 10 -T graph
+vg snarls -t 10 graph.xg > graph.snarls
+
+04 Calling SNPs using GATK
+SNP calling using NGS data:
+First intall BWA (v0.7.19), samtools (v1.4.0), GATK (v3.8) and annovar (v2013-05-20) software using conda
+1.Mapping clean reads of individual sample onto genome sequence one by one:
+bwa index genome.fa
+bwa mem -t 20 -R '@RG\tID:RYP1ID\tSM:genome' genome fq1 fq2 | samtools view -@ 20 -bh - | samtools sort -@ 20 -T test -o bam.sample.file - 
+2.Calling SNPs and InDels for individual sample one by one:
+gatk HaplotypeCaller -R genome.fa –emit-ref-confidence GVCF -I bam.sample.file -O GVCF.sample.file
+3.Megre GVCF files from all samles using GATK into one GVCF file and convert GVCF into VCF file:
+gatk CombineGVCFs -R genome.fa -V GVCF.samlpe.vcf -V GVCF.samlpe1.vcf -V GVCF.samlpe2.vcf -V... -O vcf.multiple.file.gvcf
+gatk GenotypeGVCFs -R genome.fa -V vcf.multiple.file.gvcf -O vcf.multiple.file.vcf
+4.Filtered SNP VCF
+vcftools --vcf vcf.multiple.file.vcf --recode --maf 0.05 --max-missing 0.5 --out filter.vcf
+5.Annotate SNP function using ANNOVAR software:
+gtfToGenePred.txt -genePredExt genome.gtf Database.dir/genome_refGene.txt
+perl retrieve_seq_from_fasta.pl --format refGene --seqfile genome.fa genome_refGene.txt --out Database.dir/genome_refGeneMrna.fa
+table_annovar.pl filter.vcf Database.dir/ -buildver genome  -out prefix -remove -protocol refGene -operation g -nastring . -vcfinput
+
+04 Calling SV using vg
+vg giraffe -Z graph.giraffe.gbz -m graph.min -t 20 -b fast -N sample -d graph.dist -f sample.1_clean.fq.gz -f sample.2_clean.fq.gz > sample.gam
+vg pack -t 20 -x graph.xg -g sample.gam -o sample.gam.pack -Q 5
+vg call graph.xg -r graph.snarls -k sample.gam.pack -t 20 -a -s sample > asmple.sv.vcf
+
+05 GWAS using EMMAX (v07Mar2010):
+1.Convert VCF file into tped format:
+plink (v1.9.0-b.8) --vcf vcf.file --make-bed --allow-extra-chr --out prefix1
+gcta (v1.94.1) --bfile prefix1  --make-grm --thread-num 4 --out prefix1
+gcta (v1.94.1) --grm prefix1  --pca 3 --thread-num 4 --out prefix1
+2.Run emmax:
+emmax -v -d 10 prefix1
+emmax -v -d 10 -t prefix1 -p phename.pheno -k prefix1.BN.kinf -c prefix1.eigenvec -o phename
+
+06 Transcriptome analysis
+1.hisat2 (v2.2.1) index genome.fa and Comparison
+hisat2-build genome.fa genome_index
+hisat2 -p 8 -x genome_index -1 sample_clean_R1.fq.gz -2 sample_clean_R2.fq.gz -S sample.sam
+samtools sort -@ 4 -o sample.bam sample.sam
+samtools index sample.bam
+2.quantification using featureCounts (v2.0.3)
+featureCounts -T 8 -p -a annotation.gtf -o counts.txt *.bam
+
